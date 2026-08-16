@@ -53,7 +53,9 @@ import logging
 import os
 import random
 import signal
+import socket
 import sqlite3
+import ssl
 import sys
 import termios
 import time
@@ -80,8 +82,18 @@ from rich.text import Text
 # CONFIGURATION
 # ===========================================================================
 
-REST_BASE: str = "https://fapi.binance.com"
-WS_BASE: str   = "wss://fstream.binance.com/stream"
+REST_BASE: str = os.getenv("SMC_REST_BASE", "https://fapi.binance.com")
+WS_BASE: str   = os.getenv("SMC_WS_BASE",   "wss://fstream.binance.com/stream")
+FORCE_IPV4: bool = os.getenv("SMC_FORCE_IPV4", "1") == "1"   # IPv6 often hangs on Android/Termux
+
+
+def _ssl_context() -> ssl.SSLContext:
+    """Build an SSL context, preferring certifi CA bundle (Termux-safe)."""
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
 
 KLINE_LIMIT: int        = 300    # rolling closed-candle buffer (1m)
 HTF_LIMIT: int          = 100    # HTF kline buffer (5m / 15m)
@@ -472,6 +484,31 @@ def _safe_float(val: Any, default: float = 0.0) -> float:
 def _jitter(base: float, factor: float = 0.3) -> float:
     """Add random jitter to a backoff value to avoid thundering herd."""
     return base * (1 + random.uniform(-factor, factor))
+
+
+def _classify_conn_error(exc: BaseException) -> str:
+    """Translate a connection exception into an actionable message."""
+    # HTTP status during WS handshake (websockets v11: InvalidStatusCode,
+    # v12+: InvalidStatus with .response)
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        resp = getattr(exc, "response", None)
+        status = getattr(resp, "status_code", None)
+    if status in (451, 403):
+        return (f"HTTP {status}: Binance blocks this region/IP. "
+                "Try a VPN or set SMC_WS_BASE / SMC_REST_BASE")
+    if status is not None:
+        return f"handshake rejected (HTTP {status})"
+    if isinstance(exc, ssl.SSLError):
+        return ("SSL error: run 'pip install -U certifi' "
+                "(Termux: pkg install ca-certificates)")
+    if isinstance(exc, socket.gaierror) or "getaddrinfo" in str(exc):
+        return "DNS lookup failed: check internet connection"
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return "connection timeout: network/firewall blocking wss:443"
+    if isinstance(exc, (ConnectionRefusedError, ConnectionResetError, OSError)):
+        return f"network error: {exc}"
+    return str(exc) or exc.__class__.__name__
 
 
 def _age_str(born: float) -> str:
@@ -1245,6 +1282,14 @@ _COND_MARK: Dict[CondState, str] = {
 }
 
 
+_SPINNER_FRAMES = "\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f"
+
+
+def _spinner() -> str:
+    """Animated braille spinner frame based on wall clock."""
+    return _SPINNER_FRAMES[int(time.time() * 8) % len(_SPINNER_FRAMES)]
+
+
 def _score_bar(score: int, max_s: int, width: int = 12) -> str:
     """Render a simple text progress bar for the score."""
     filled = int(score / max_s * width) if max_s else 0
@@ -1254,6 +1299,57 @@ def _score_bar(score: int, max_s: int, width: int = 12) -> str:
     return f"[{color}]{bar}[/] {score}/{max_s}"
 
 
+def _score_gauge(score: int, width: int = 20) -> str:
+    """Score gauge with WATCH / PRE_SIGNAL / ARMED threshold ticks."""
+    if MAX_SCORE <= 0:
+        return "-"
+    filled = int(score / MAX_SCORE * width)
+    chars: List[str] = []
+    marks = {
+        int(SCORE_WATCH / MAX_SCORE * width): "cyan",
+        int(SCORE_PRE   / MAX_SCORE * width): "yellow",
+        int(SCORE_ARMED / MAX_SCORE * width): "red",
+    }
+    fill_color = (
+        "red" if score >= SCORE_ARMED
+        else "yellow" if score >= SCORE_PRE
+        else "cyan" if score >= SCORE_WATCH
+        else "dim"
+    )
+    for i in range(width):
+        if i in marks and i >= filled:
+            chars.append(f"[{marks[i]}]\u2506[/]")
+        elif i < filled:
+            chars.append(f"[{fill_color}]\u2588[/]")
+        else:
+            chars.append("[dim]\u2591[/]")
+    pct = score / MAX_SCORE * 100
+    return "".join(chars) + f" [bold {fill_color}]{score}[/]/{MAX_SCORE} [dim]({pct:.0f}%)[/]"
+
+
+def _next_state_info(score: int) -> str:
+    """Describe distance to the next state threshold."""
+    if score >= SCORE_ARMED:
+        return "[bold red]MAX TIER - ARMED[/]"
+    if score >= SCORE_PRE:
+        return f"[red]+{SCORE_ARMED - score} pts to ARMED[/]"
+    if score >= SCORE_WATCH:
+        return f"[yellow]+{SCORE_PRE - score} pts to PRE_SIGNAL[/]"
+    return f"[cyan]+{SCORE_WATCH - score} pts to WATCH[/]"
+
+
+def _tick_age_str(tick: TickData) -> str:
+    """Human age of last tick, colored by freshness."""
+    if not tick.last_ts:
+        return "[dim]no data[/]"
+    age = time.time() - tick.last_ts
+    if age < 3:
+        return f"[green]\u25cf {age:.0f}s[/]"
+    if age < 15:
+        return f"[yellow]\u25cf {age:.0f}s[/]"
+    return f"[red]\u25cf stale {age:.0f}s[/]"
+
+
 def _px_color(tick: TickData) -> str:
     """Color string for live price based on 1s change."""
     if tick.price_change_1s > 0:
@@ -1261,6 +1357,15 @@ def _px_color(tick: TickData) -> str:
     if tick.price_change_1s < 0:
         return "red"
     return "white"
+
+
+def _px_arrow(tick: TickData) -> str:
+    """Direction arrow for last price move."""
+    if tick.price_change_1s > 0:
+        return "\u25b2"
+    if tick.price_change_1s < 0:
+        return "\u25bc"
+    return "\u2500"
 
 
 # ===========================================================================
@@ -1316,6 +1421,8 @@ class App:
         self.reconnects:     int   = 0
         self.ws_latency_ms:  float = 0.0
         self.clock_drift_ms: float = 0.0
+        self.ws_error:       str   = ""
+        self.msg_times:      Deque[float] = deque(maxlen=400)
 
         self._kb_restore = lambda: None
 
@@ -1348,13 +1455,13 @@ class App:
             with Live(
                 self._render(),
                 console=self.console,
-                refresh_per_second=1,
+                refresh_per_second=4,
                 screen=True,
                 transient=False,
             ) as live:
                 while not self.stop.is_set():
                     live.update(self._render())
-                    await asyncio.sleep(1.0)
+                    await asyncio.sleep(0.25)
         finally:
             self.monitoring = False
             for t in (self.ws_task, scan_task, tg_task, clock_task,
@@ -1679,6 +1786,29 @@ class App:
         self.ticks.setdefault(sym, TickData())
         self.ws_last_msg[sym] = time.time()
 
+    async def _preflight(self) -> bool:
+        """REST connectivity check with actionable diagnosis before WS connect."""
+        try:
+            async with self.session.get(
+                f"{REST_BASE}/fapi/v1/ping",
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status in (451, 403):
+                    self.ws_error = (
+                        f"HTTP {resp.status}: Binance blocks this region/IP. "
+                        "Try a VPN or set SMC_WS_BASE / SMC_REST_BASE"
+                    )
+                    log.warning("preflight_geoblock status=%d", resp.status)
+                    return False
+                resp.raise_for_status()
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.ws_error = _classify_conn_error(exc)
+            log.warning("preflight_err=%s", self.ws_error)
+            return False
+
     async def _ws_loop(self) -> None:
         """Main WebSocket loop with exponential backoff and auto-reconnect."""
         backoff = 1.0
@@ -1688,6 +1818,14 @@ class App:
                 await asyncio.sleep(1)
                 continue
             try:
+                # Preflight REST check surfaces geo-block / DNS / SSL causes
+                # instead of an eternal silent "RECONNECTING".
+                if not await self._preflight():
+                    self.conn_ok = False
+                    await asyncio.sleep(_jitter(backoff))
+                    backoff = min(backoff * 2, 60.0)
+                    continue
+
                 for sym in symbols:
                     await self._bootstrap_symbol(sym)
 
@@ -1702,15 +1840,21 @@ class App:
                     ]
                 url = f"{WS_BASE}?streams={'/'.join(streams)}"
 
-                async with websockets.connect(
-                    url,
+                connect_kwargs: Dict[str, Any] = dict(
                     ping_interval=20,
                     ping_timeout=20,
                     max_queue=512,
                     open_timeout=15,
-                ) as ws:
-                    self.conn_ok = True
-                    backoff      = 1.0
+                    close_timeout=5,
+                    ssl=_ssl_context(),
+                )
+                if FORCE_IPV4:
+                    connect_kwargs["family"] = socket.AF_INET
+
+                async with websockets.connect(url, **connect_kwargs) as ws:
+                    self.conn_ok  = True
+                    self.ws_error = ""
+                    backoff       = 1.0
                     log.info("ws_connected symbols=%d streams=%d",
                              len(symbols), len(streams))
 
@@ -1722,6 +1866,7 @@ class App:
                         raw = await asyncio.wait_for(ws.recv(), timeout=STALE_SEC)
                         self.ws_latency_ms = (time.time() - t0) * 1000
                         self.msg_count    += 1
+                        self.msg_times.append(time.time())
                         try:
                             self._dispatch(json.loads(raw))
                         except Exception as exc:
@@ -1730,12 +1875,17 @@ class App:
             except asyncio.CancelledError:
                 break
             except asyncio.TimeoutError:
-                self.conn_ok = False
-                log.warning("ws_timeout reconnecting=1")
-            except Exception as exc:
-                self.conn_ok = False
+                self.conn_ok    = False
                 self.reconnects += 1
-                log.warning("ws_err=%s backoff=%.1f", exc, backoff)
+                self.ws_error   = "stream silent/timeout - reconnecting"
+                log.warning("ws_timeout reconnecting=1 backoff=%.1f", backoff)
+                await asyncio.sleep(_jitter(backoff))
+                backoff = min(backoff * 2, 30.0)
+            except Exception as exc:
+                self.conn_ok    = False
+                self.reconnects += 1
+                self.ws_error   = _classify_conn_error(exc)
+                log.warning("ws_err=%s backoff=%.1f", self.ws_error, backoff)
                 await asyncio.sleep(_jitter(backoff))
                 backoff = min(backoff * 2, 60.0)
 
@@ -2000,10 +2150,15 @@ class App:
         h_u, m_u, s_u = uptime // 3600, (uptime % 3600) // 60, uptime % 60
         uptime_str = f"{h_u:02d}:{m_u:02d}:{s_u:02d}"
 
+        # Rolling msg/s over the last 5 seconds -> feels live
+        now      = time.time()
+        recent   = sum(1 for t_ in self.msg_times if now - t_ <= 5.0)
+        msg_rate = recent / 5.0
+
         if self.monitoring and self.conn_ok:
-            status = Text("\u25cf LIVE", style="bold green")
+            status = Text(f"{_spinner()} LIVE", style="bold green")
         elif self.monitoring:
-            status = Text("\u25cc RECONNECTING", style="bold yellow")
+            status = Text(f"{_spinner()} RECONNECTING", style="bold yellow")
         else:
             status = Text("\u25cb IDLE", style="dim")
 
@@ -2014,6 +2169,8 @@ class App:
         if narrow:
             t = Text("SMC SHORT ENGINE\n", style="bold white", justify="center")
             t.append_text(status)
+            if self.monitoring and self.conn_ok:
+                t.append(f"  {msg_rate:.1f} msg/s", style="dim")
         else:
             t = Text(
                 "SMC SHORT PRE-SIGNAL ENGINE  -  Binance USDT-Perp  -  SHORT only\n",
@@ -2024,13 +2181,20 @@ class App:
             t.append(
                 f"  uptime {uptime_str}"
                 f"  ws {self.ws_latency_ms:.0f}ms"
-                f"  msg/s {self.msg_count // max(1, uptime)}"
+                f"  {msg_rate:.1f} msg/s"
                 f"  reconnects {self.reconnects}"
                 f"  session {_current_session()}"
                 f"{drift_warn}",
                 style="dim",
             )
-        return Panel(t, style="cyan", padding=(0, 1))
+        if self.monitoring and not self.conn_ok and self.ws_error:
+            t.append(f"\n\u26a0 {self.ws_error}", style="bold red")
+        panel_style = (
+            "green" if self.monitoring and self.conn_ok
+            else "yellow" if self.monitoring
+            else "cyan"
+        )
+        return Panel(t, style=panel_style, padding=(0, 1))
 
     def _render_scanner(self, narrow: bool) -> Panel:
         """Render the volatility scanner panel."""
@@ -2120,8 +2284,8 @@ class App:
         countdown = _candle_close_countdown()
         tb.add_row(
             "Live price",
-            f"[{px_color}]{px_str}[/]  [{px_color}]{chg_str}[/]  "
-            f"[dim]{spark}[/]  [dim]close in {countdown}s[/]",
+            f"[bold {px_color}]{_px_arrow(tick)} {px_str}[/]  [{px_color}]{chg_str}[/]  "
+            f"[dim]{spark}[/]  {_tick_age_str(tick)}  [dim]close in {countdown}s[/]",
         )
 
         if not narrow:
@@ -2146,13 +2310,28 @@ class App:
                 f"[{oi_color}]{fi.oi_change_pct:+.2f}%[/]",
             )
 
-        # SMC conditions (compact)
+        # SMC conditions (compact, weighted)
         if a:
             for k in WEIGHTS:
-                mark  = _COND_MARK[a.conds[k]]
+                st    = a.conds[k]
+                mark  = _COND_MARK[st]
                 label = COND_LABELS[k]
-                tb.add_row(label, mark)
-            tb.add_row("Score",      _score_bar(a.score, MAX_SCORE))
+                if st == CondState.OK:
+                    pts = f"[green]+{WEIGHTS[k]}[/]"
+                elif st == CondState.DEV:
+                    pts = f"[yellow]~{WEIGHTS[k]}[/]"
+                else:
+                    pts = f"[dim]\u00b7{WEIGHTS[k]}[/]"
+                tb.add_row(label, f"{mark} {pts}")
+            tb.add_row("[bold]-- ENGINE SCORE --[/]", "")
+            tb.add_row("Score",      _score_gauge(a.score))
+            tb.add_row("Next state", _next_state_info(a.score))
+            tb.add_row(
+                "Thresholds",
+                f"[cyan]WATCH {SCORE_WATCH}[/] [dim]/[/] "
+                f"[yellow]PRE {SCORE_PRE}[/] [dim]/[/] "
+                f"[red]ARMED {SCORE_ARMED}[/]",
+            )
             tb.add_row("HTF bias",   a.htf_bias)
             tb.add_row("Zone type",  a.premium_disc)
             tb.add_row(
@@ -2160,7 +2339,7 @@ class App:
                 Text(s.confidence.value, style=_CONF_STYLE[s.confidence]),
             )
         else:
-            tb.add_row("[dim]waiting for closed candles...[/]", "")
+            tb.add_row(f"[dim]{_spinner()} waiting for closed candles...[/]", "")
 
         # LuxAlgo-style 1m detections
         d = s.detections
@@ -2228,8 +2407,8 @@ class App:
         tb.add_row("[bold]-- LIVE DATA --[/]", "")
         tb.add_row(
             "Price",
-            f"[{px_color}]{tick.price:.8g}[/]  "
-            f"[{px_color}]{tick.price_change_1s:+.4g}[/]",
+            f"[bold {px_color}]{_px_arrow(tick)} {tick.price:.8g}[/]  "
+            f"[{px_color}]{tick.price_change_1s:+.4g}[/]  {_tick_age_str(tick)}",
         )
         tb.add_row("Sparkline", f"[dim]{_sparkline(tick.price_hist)}[/]")
         tb.add_row(
@@ -2246,15 +2425,27 @@ class App:
         tb.add_row("Candle closes in", f"{_candle_close_countdown()}s")
 
         if a:
-            tb.add_row("[bold]-- SMC CONDITIONS --[/]", "")
+            tb.add_row("[bold]-- SMC CONDITIONS (weighted) --[/]", "")
             for k in WEIGHTS:
                 st   = a.conds[k]
                 mark = _COND_MARK[st]
-                suf  = " (developing)" if st == CondState.DEV else ""
-                tb.add_row(COND_LABELS[k], f"{mark}{suf}")
+                if st == CondState.OK:
+                    pts = f"[green]+{WEIGHTS[k]} pts[/]"
+                elif st == CondState.DEV:
+                    pts = f"[yellow]~{WEIGHTS[k]} pts (developing)[/]"
+                else:
+                    pts = f"[dim]0/{WEIGHTS[k]} pts[/]"
+                tb.add_row(COND_LABELS[k], f"{mark} {pts}")
 
-            tb.add_row("[bold]-- ANALYSIS --[/]", "")
-            tb.add_row("Score",       _score_bar(a.score, MAX_SCORE, width=16))
+            tb.add_row("[bold]-- ENGINE SCORE --[/]", "")
+            tb.add_row("Score",       _score_gauge(a.score, width=24))
+            tb.add_row("Next state",  _next_state_info(a.score))
+            tb.add_row(
+                "Thresholds",
+                f"[cyan]WATCH \u2265{SCORE_WATCH}[/]  "
+                f"[yellow]PRE_SIGNAL \u2265{SCORE_PRE}[/]  "
+                f"[red]ARMED \u2265{SCORE_ARMED}[/]",
+            )
             tb.add_row(
                 "Confidence",
                 Text(a.confidence.value, style=_CONF_STYLE[a.confidence]),
