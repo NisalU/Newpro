@@ -125,6 +125,7 @@ SCORE_WATCH: int = int(os.getenv("SMC_SCORE_WATCH",  "4"))
 # ---------------------------------------------------------------------------
 EQ_CONFIRM_LEN: int     = int(os.getenv("SMC_EQ_LEN", "3"))          # bars confirmation
 EQ_THRESHOLD: float     = float(os.getenv("SMC_EQ_THRESHOLD", "0.1"))  # x ATR sensitivity
+EQ_LOOKBACK: int        = int(os.getenv("SMC_EQ_LOOKBACK", "120"))   # bars a pair stays valid
 OB_INTERNAL_LEN: int    = int(os.getenv("SMC_OB_LEN", "5"))          # internal pivot length
 OB_SHOW_LAST: int       = int(os.getenv("SMC_OB_SHOW", "5"))         # active OBs kept per side
 PRETRADE_COOLDOWN: int  = int(os.getenv("SMC_PRETRADE_COOLDOWN", "180"))  # s between pre-trade alerts
@@ -640,17 +641,48 @@ def _detect_equal_extremes(
     eqh: Optional[Tuple[float, int]] = None
     eql: Optional[Tuple[float, int]] = None
 
-    ph = _pivot_points(h, EQ_CONFIRM_LEN, True)
-    if len(ph) >= 2:
-        a, b = ph[-2], ph[-1]
-        if max(h[a], h[b]) - min(h[a], h[b]) < EQ_THRESHOLD * atr_val:
-            eqh = (float(max(h[a], h[b])), candles[b].t)
+    # Scan recent pivot PAIRS (newest first) instead of only the single last
+    # consecutive pair. Any two pivots within EQ_LOOKBACK bars whose levels
+    # match within the ATR threshold form an EQH/EQL, provided the level was
+    # never exceeded between or after them (liquidity still resting there).
+    ph = [i for i in _pivot_points(h, EQ_CONFIRM_LEN, True) if i >= n - EQ_LOOKBACK]
+    for bi in range(len(ph) - 1, 0, -1):
+        if eqh:
+            break
+        b = ph[bi]
+        for ai in range(bi - 1, -1, -1):
+            a = ph[ai]
+            if abs(h[a] - h[b]) >= EQ_THRESHOLD * atr_val:
+                continue
+            level = float(max(h[a], h[b]))
+            # level must be unbroken between the pivots and afterwards
+            between = h[a + 1:b]
+            after   = h[b + 1:]
+            if len(between) and float(between.max()) > level:
+                continue
+            if len(after) and float(after.max()) > level:
+                continue
+            eqh = (level, candles[b].t)
+            break
 
-    pl = _pivot_points(l, EQ_CONFIRM_LEN, False)
-    if len(pl) >= 2:
-        a, b = pl[-2], pl[-1]
-        if max(l[a], l[b]) - min(l[a], l[b]) < EQ_THRESHOLD * atr_val:
-            eql = (float(min(l[a], l[b])), candles[b].t)
+    pl = [i for i in _pivot_points(l, EQ_CONFIRM_LEN, False) if i >= n - EQ_LOOKBACK]
+    for bi in range(len(pl) - 1, 0, -1):
+        if eql:
+            break
+        b = pl[bi]
+        for ai in range(bi - 1, -1, -1):
+            a = pl[ai]
+            if abs(l[a] - l[b]) >= EQ_THRESHOLD * atr_val:
+                continue
+            level = float(min(l[a], l[b]))
+            between = l[a + 1:b]
+            after   = l[b + 1:]
+            if len(between) and float(between.min()) < level:
+                continue
+            if len(after) and float(after.min()) < level:
+                continue
+            eql = (level, candles[b].t)
+            break
 
     return eqh, eql
 
@@ -1851,7 +1883,12 @@ class App:
                 log.warning("bootstrap_err sym=%s tf=%s err=%s", sym, interval, exc)
 
         self.setups.setdefault(sym, Setup())
-        self.ticks.setdefault(sym, TickData())
+        tick = self.ticks.setdefault(sym, TickData())
+        buf1 = self.buffers_1m.get(sym)
+        if buf1 and tick.price == 0.0:
+            # Seed live price from the last bootstrapped close so the UI
+            # shows a price immediately instead of "no data".
+            tick.update_price(buf1[-1].c)
         self.ws_last_msg[sym] = time.time()
 
     async def _preflight(self) -> bool:
@@ -1896,6 +1933,14 @@ class App:
 
                 for sym in symbols:
                     await self._bootstrap_symbol(sym)
+                    # Instant first analysis from bootstrapped history -
+                    # no need to wait for the next live candle close.
+                    if self.buffers_1m.get(sym):
+                        try:
+                            self._evaluate(sym)
+                        except Exception as exc:
+                            log.warning("bootstrap_eval_err sym=%s err=%s",
+                                        sym, exc)
 
                 # Build combined stream URL
                 streams: List[str] = []
@@ -1938,7 +1983,7 @@ class App:
                         try:
                             self._dispatch(json.loads(raw))
                         except Exception as exc:
-                            log.debug("dispatch_err=%s", exc)
+                            log.warning("dispatch_err=%s", exc)
 
             except asyncio.CancelledError:
                 break
@@ -1989,7 +2034,11 @@ class App:
 
         buf = self.buffers_1m.get(sym)
         if buf is None:
-            return
+            # Bootstrap may have failed for this symbol - build the buffer
+            # live instead of silently dropping closed candles forever.
+            buf = deque(maxlen=KLINE_LIMIT)
+            self.buffers_1m[sym] = buf
+            log.warning("kline_buf_missing sym=%s created_live_buffer=1", sym)
         candle = Candle(
             int(k.get("t", 0)),
             _safe_float(k.get("o")), _safe_float(k.get("h")),
