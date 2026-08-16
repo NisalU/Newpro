@@ -1368,6 +1368,74 @@ def _px_arrow(tick: TickData) -> str:
     return "\u2500"
 
 
+def _tier_color(score: int) -> str:
+    """Color for the current score tier."""
+    if score >= SCORE_ARMED:
+        return "red"
+    if score >= SCORE_PRE:
+        return "yellow"
+    if score >= SCORE_WATCH:
+        return "cyan"
+    return "bright_black"
+
+
+def _live_bias(tick: TickData, fi: FundingOI) -> int:
+    """Heuristic 0-100 live SHORT bias from tick-level data (display only).
+
+    Updates every frame from live streams - it does NOT affect the engine
+    score or the state machine. It exists so the dashboard feels alive
+    between candle closes.
+    """
+    pts = 0
+    if tick.cvd_delta < 0:
+        pts += 30                       # sell-side aggression
+    if tick.price_change_1s < 0:
+        pts += 20                       # downward tick momentum
+    if len(tick.price_hist) >= 2 and tick.price_hist[-1] < tick.price_hist[0]:
+        pts += 20                       # sparkline window trending down
+    if fi.funding_rate > 0:
+        pts += 15                       # crowded longs paying funding
+    if fi.oi_change_pct < 0:
+        pts += 15                       # open interest unwinding
+    return pts
+
+
+def _bias_bar(pct: int, width: int = 10) -> str:
+    """Compact 0-100% live-bias meter."""
+    filled = max(0, min(width, int(pct / 100 * width)))
+    color  = "red" if pct >= 70 else ("yellow" if pct >= 40 else "dim")
+    bar    = "\u2588" * filled + "\u2591" * (width - filled)
+    return f"[{color}]{bar}[/] [bold {color}]{pct}%[/]"
+
+
+# Short labels for compact condition chips
+_COND_SHORT: Dict[str, str] = {
+    "liquidity":   "LIQ",
+    "eqh":         "EQH",
+    "sweep":       "SWEEP",
+    "mss":         "MSS",
+    "fvg":         "FVG",
+    "ob":          "OB",
+    "vol":         "VOL",
+    "breaker":     "BRKR",
+    "inducement":  "INDC",
+    "wick_reject": "WICK",
+    "htf_bear":    "HTF",
+    "session":     "SESS",
+}
+
+
+def _cond_chip(key: str, st: CondState) -> str:
+    """Render one compact condition chip like [green]✓SWEEP+3[/]."""
+    label = _COND_SHORT.get(key, key.upper())
+    w     = WEIGHTS[key]
+    if st == CondState.OK:
+        return f"[green]\u2713{label}+{w}[/]"
+    if st == CondState.DEV:
+        return f"[yellow]~{label}\u00b7{w}[/]"
+    return f"[dim]\u25cb{label}[/]"
+
+
 # ===========================================================================
 # MAIN APPLICATION
 # ===========================================================================
@@ -2166,11 +2234,22 @@ class App:
         if abs(self.clock_drift_ms) > CLOCK_DRIFT_WARN_MS:
             drift_warn = f"  \u26a0 clock drift {self.clock_drift_ms:+.0f}ms"
 
+        # Best live engine score across monitored symbols
+        best_sym, best_score = "", -1
+        for sym_, s_ in self.setups.items():
+            if s_.last and s_.last.score > best_score:
+                best_sym, best_score = sym_, s_.last.score
+
         if narrow:
             t = Text("SMC SHORT ENGINE\n", style="bold white", justify="center")
             t.append_text(status)
             if self.monitoring and self.conn_ok:
                 t.append(f"  {msg_rate:.1f} msg/s", style="dim")
+            if best_score >= 0:
+                t.append(
+                    f"  top {best_sym} {best_score}/{MAX_SCORE}",
+                    style=f"bold {_tier_color(best_score)}",
+                )
         else:
             t = Text(
                 "SMC SHORT PRE-SIGNAL ENGINE  -  Binance USDT-Perp  -  SHORT only\n",
@@ -2187,6 +2266,11 @@ class App:
                 f"{drift_warn}",
                 style="dim",
             )
+            if best_score >= 0:
+                t.append(
+                    f"  top {best_sym} {best_score}/{MAX_SCORE}",
+                    style=f"bold {_tier_color(best_score)}",
+                )
         if self.monitoring and not self.conn_ok and self.ws_error:
             t.append(f"\n\u26a0 {self.ws_error}", style="bold red")
         panel_style = (
@@ -2251,29 +2335,52 @@ class App:
         )
 
     def _render_selected_bar(self) -> Panel:
-        """Render the selected-symbols bar."""
+        """Render the selected-symbols bar with live engine scores."""
         parts: List[Text] = []
         for sym in sorted(self.selected):
             s     = self.setups.get(sym)
-            style = _STATE_STYLE.get(s.state if s else "NO_SETUP", "dim")
-            parts.append(Text(sym, style=f"bold {style}"))
+            state = s.state if s else "NO_SETUP"
+            style = _STATE_STYLE.get(state, "dim")
+            score = s.last.score if s and s.last else 0
+            tier  = _tier_color(score)
+            t = Text(sym, style=f"bold {style}")
+            t.append(f" {score}/{MAX_SCORE}", style=tier)
+            parts.append(t)
         txt   = Text("  ").join(parts) if parts else Text("none", style="dim")
         count = Text(f"{len(self.selected)}/{MAX_SELECT}  ", style="bold")
         count.append_text(txt)
-        return Panel(count, title="SELECTED", style="blue", padding=(0, 1))
+        return Panel(
+            count,
+            title="SELECTED  (live engine score)",
+            style="blue",
+            padding=(0, 1),
+        )
 
     def _render_coin_row(self, sym: str, narrow: bool) -> Panel:
-        """Render a compact per-coin monitoring row."""
+        """Render a score-first per-coin monitoring card."""
         s    = self.setups.get(sym) or Setup()
         a    = s.last
         tick = self.ticks.get(sym) or TickData()
         fi   = self.funding_oi.get(sym) or FundingOI()
 
+        score = a.score if a else 0
+        tier  = _tier_color(score)
+
         tb = Table.grid(padding=(0, 1))
-        tb.add_column(min_width=16)
+        tb.add_column(min_width=12)
         tb.add_column()
 
-        # Live price row
+        # -- ENGINE SCORE (always visible, top of the card) -----------------
+        gauge_w = 12 if narrow else 20
+        tb.add_row("[bold]ENGINE[/]", _score_gauge(score, width=gauge_w))
+        bias = _live_bias(tick, fi)
+        tb.add_row(
+            "[bold]LIVE BIAS[/]",
+            f"{_bias_bar(bias)}  [dim]{_next_state_info(score)}[/]"
+            if not narrow else _bias_bar(bias),
+        )
+
+        # -- Live price ------------------------------------------------------
         px_color  = _px_color(tick)
         px_str    = f"{tick.price:.6g}" if tick.price else "-"
         chg_str   = (
@@ -2283,63 +2390,50 @@ class App:
         spark     = _sparkline(tick.price_hist)
         countdown = _candle_close_countdown()
         tb.add_row(
-            "Live price",
+            "Price",
             f"[bold {px_color}]{_px_arrow(tick)} {px_str}[/]  [{px_color}]{chg_str}[/]  "
-            f"[dim]{spark}[/]  {_tick_age_str(tick)}  [dim]close in {countdown}s[/]",
+            f"[dim]{spark}[/]  {_tick_age_str(tick)}  [dim]close {countdown}s[/]",
         )
 
+        # -- Order flow (one compact line) -----------------------------------
         if not narrow:
-            spread_str = (
-                f"{tick.spread:.4g} ({tick.spread_pct:.3f}%)"
-                if tick.spread else "-"
-            )
             cvd_color = "red" if tick.cvd_delta < 0 else "green"
-            tb.add_row("Bid/Ask spread", spread_str)
-            tb.add_row(
-                "CVD (60s)",
-                f"[{cvd_color}]{tick.cvd_delta:+.2f}[/]",
+            fr_color  = "red" if fi.funding_rate > 0 else "green"
+            oi_color  = "red" if fi.oi_change_pct < 0 else "green"
+            spread_str = (
+                f"{tick.spread_pct:.3f}%" if tick.spread else "-"
             )
-            fr_color = "red" if fi.funding_rate > 0 else "green"
             tb.add_row(
-                "Funding rate",
-                f"[{fr_color}]{fi.funding_rate:+.4f}%[/]",
-            )
-            oi_color = "red" if fi.oi_change_pct < 0 else "green"
-            tb.add_row(
-                "OI change",
-                f"[{oi_color}]{fi.oi_change_pct:+.2f}%[/]",
+                "Flow",
+                f"CVD [{cvd_color}]{tick.cvd_delta:+.2f}[/] [dim]\u00b7[/] "
+                f"fund [{fr_color}]{fi.funding_rate:+.4f}%[/] [dim]\u00b7[/] "
+                f"OI [{oi_color}]{fi.oi_change_pct:+.2f}%[/] [dim]\u00b7[/] "
+                f"spr [dim]{spread_str}[/]",
             )
 
-        # SMC conditions (compact, weighted)
+        # -- SMC conditions as compact chips ---------------------------------
         if a:
-            for k in WEIGHTS:
-                st    = a.conds[k]
-                mark  = _COND_MARK[st]
-                label = COND_LABELS[k]
-                if st == CondState.OK:
-                    pts = f"[green]+{WEIGHTS[k]}[/]"
-                elif st == CondState.DEV:
-                    pts = f"[yellow]~{WEIGHTS[k]}[/]"
-                else:
-                    pts = f"[dim]\u00b7{WEIGHTS[k]}[/]"
-                tb.add_row(label, f"{mark} {pts}")
-            tb.add_row("[bold]-- ENGINE SCORE --[/]", "")
-            tb.add_row("Score",      _score_gauge(a.score))
-            tb.add_row("Next state", _next_state_info(a.score))
-            tb.add_row(
-                "Thresholds",
-                f"[cyan]WATCH {SCORE_WATCH}[/] [dim]/[/] "
-                f"[yellow]PRE {SCORE_PRE}[/] [dim]/[/] "
-                f"[red]ARMED {SCORE_ARMED}[/]",
+            chips     = [_cond_chip(k, a.conds[k]) for k in WEIGHTS]
+            per_row   = 3 if narrow else 4
+            first     = True
+            for i in range(0, len(chips), per_row):
+                tb.add_row(
+                    "Signals" if first else "",
+                    "  ".join(chips[i:i + per_row]),
+                )
+                first = False
+            ctx = (
+                f"HTF [bold]{a.htf_bias}[/] [dim]\u00b7[/] "
+                f"{a.premium_disc} [dim]\u00b7[/] "
+                f"conf [{_CONF_STYLE[s.confidence]}]{s.confidence.value}[/]"
             )
-            tb.add_row("HTF bias",   a.htf_bias)
-            tb.add_row("Zone type",  a.premium_disc)
-            tb.add_row(
-                "Confidence",
-                Text(s.confidence.value, style=_CONF_STYLE[s.confidence]),
-            )
+            tb.add_row("Context", ctx)
         else:
-            tb.add_row(f"[dim]{_spinner()} waiting for closed candles...[/]", "")
+            tb.add_row(
+                "Signals",
+                f"[dim]{_spinner()} first analysis after candle close "
+                f"({countdown}s)[/]",
+            )
 
         # LuxAlgo-style 1m detections
         d = s.detections
@@ -2382,11 +2476,18 @@ class App:
         panel_style = (
             "bold yellow" if s.state == "PRE_SIGNAL"
             else "bold red" if s.state == "ARMED"
-            else "white"
+            else tier
         )
+        pct = int(score / MAX_SCORE * 100) if MAX_SCORE else 0
         return Panel(
             tb,
-            title=f"[bold]{sym}[/]  {px_str}  1M",
+            title=(
+                f"[bold]{sym}[/] [dim]\u00b7[/] {px_str} [dim]\u00b7 1M \u00b7[/] "
+                f"[bold {tier}]{score}/{MAX_SCORE}[/] [dim]({pct}%)[/]"
+            ),
+            title_align="left",
+            subtitle=f"[{_STATE_STYLE.get(s.state, 'dim')}]{s.state}[/]",
+            subtitle_align="right",
             style=panel_style,
             padding=(0, 1),
         )
@@ -2422,6 +2523,11 @@ class App:
         tb.add_row("Funding rate", f"[{fr_color}]{fi.funding_rate:+.4f}%[/]")
         oi_color = "red" if fi.oi_change_pct < 0 else "green"
         tb.add_row("OI change", f"[{oi_color}]{fi.oi_change_pct:+.2f}%[/]")
+        tb.add_row(
+            "Live bias",
+            f"{_bias_bar(_live_bias(tick, fi), width=16)}  "
+            f"[dim]tick-level short bias[/]",
+        )
         tb.add_row("Candle closes in", f"{_candle_close_countdown()}s")
 
         if a:
