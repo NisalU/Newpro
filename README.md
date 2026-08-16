@@ -15,8 +15,9 @@ Telegram alerts.
 
 | Category | Details |
 |---|---|
-| **Dashboard** | 1-second refresh · live price flash · sparkline · bid/ask spread · CVD delta · candle countdown |
+| **Dashboard** | 1-second refresh · live price flash · sparkline · bid/ask spread · CVD delta · candle countdown · SMC 1m detections panel (EQH/EQL/Bull OB/Bear OB) |
 | **SMC Engine** | 12 weighted conditions · multi-TF (1m/5m/15m) · breaker blocks · inducement · wick rejection · ATR-normalised displacement |
+| **LuxAlgo-style 1m detections** | Equal Highs (EQH) · Equal Lows (EQL) · Bullish/Bearish internal Order Blocks with volatility-parsed zones and high/low mitigation · 🔔 PRE-TRADE signal fired the moment any appear on the 1m chart |
 | **Scanner** | 24h change · 1h volume multiple · ATR% · short-bias score · keys 1-9 select · `a` auto-select |
 | **State machine** | NO_SETUP → WATCH → PRE_SIGNAL → ARMED → INVALIDATED · confidence tier LOW/MED/HIGH |
 | **Alerts** | Telegram · dedupe + cooldown · SQLite history · in-UI alert feed |
@@ -63,6 +64,11 @@ python smc_short_engine.py
 | `SMC_SCORE_PRE` | `9` | Score threshold for PRE_SIGNAL state |
 | `SMC_SCORE_WATCH` | `4` | Score threshold for WATCH state |
 | `SMC_WEIGHT_<COND>` | *(see code)* | Per-condition weight override (e.g. `SMC_WEIGHT_SWEEP=4`) |
+| `SMC_EQ_LEN` | `3` | Bars confirmation for equal highs/lows pivots (LuxAlgo default) |
+| `SMC_EQ_THRESHOLD` | `0.1` | EQH/EQL sensitivity threshold × ATR (0–0.5, LuxAlgo default) |
+| `SMC_OB_LEN` | `5` | Internal pivot length for order block detection |
+| `SMC_OB_SHOW` | `5` | Active (unmitigated) order blocks kept per side |
+| `SMC_PRETRADE_COOLDOWN` | `180` | Seconds between PRE-TRADE signals per symbol |
 
 ---
 

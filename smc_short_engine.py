@@ -108,6 +108,15 @@ SCORE_ARMED: int = int(os.getenv("SMC_SCORE_ARMED", "14"))
 SCORE_PRE: int   = int(os.getenv("SMC_SCORE_PRE",   "9"))
 SCORE_WATCH: int = int(os.getenv("SMC_SCORE_WATCH",  "4"))
 
+# ---------------------------------------------------------------------------
+# LuxAlgo-style SMC detection settings (1m timeframe)
+# ---------------------------------------------------------------------------
+EQ_CONFIRM_LEN: int     = int(os.getenv("SMC_EQ_LEN", "3"))          # bars confirmation
+EQ_THRESHOLD: float     = float(os.getenv("SMC_EQ_THRESHOLD", "0.1"))  # x ATR sensitivity
+OB_INTERNAL_LEN: int    = int(os.getenv("SMC_OB_LEN", "5"))          # internal pivot length
+OB_SHOW_LAST: int       = int(os.getenv("SMC_OB_SHOW", "5"))         # active OBs kept per side
+PRETRADE_COOLDOWN: int  = int(os.getenv("SMC_PRETRADE_COOLDOWN", "180"))  # s between pre-trade alerts
+
 
 def _w(key: str, default: int) -> int:
     """Read per-condition weight from env (SMC_WEIGHT_<KEY>)."""
@@ -382,6 +391,38 @@ class FundingOI:
 
 
 @dataclass
+class OBZone:
+    """LuxAlgo-style order block zone (volatility-parsed high/low)."""
+
+    top:      float
+    bottom:   float
+    bar_time: int
+    bias:     int              # 1 = BULLISH, -1 = BEARISH
+    mitigated: bool = False
+
+
+@dataclass
+class SMCDetections:
+    """LuxAlgo-style 1m detections: EQH / EQL / order blocks."""
+
+    eqh_level: Optional[float] = None
+    eqh_time:  int             = 0
+    eql_level: Optional[float] = None
+    eql_time:  int             = 0
+    bull_obs:  List[OBZone]    = field(default_factory=list)
+    bear_obs:  List[OBZone]    = field(default_factory=list)
+
+    @property
+    def any_detected(self) -> bool:
+        return (
+            self.eqh_level is not None
+            or self.eql_level is not None
+            or bool(self.bull_obs)
+            or bool(self.bear_obs)
+        )
+
+
+@dataclass
 class Setup:
     """State machine for one symbol."""
 
@@ -395,6 +436,12 @@ class Setup:
     last_alert_ts:    float     = 0.0
     last:             Optional[Analysis] = None
     confidence:       Confidence = Confidence.LOW
+    # LuxAlgo-style 1m detections + pre-trade dedupe tracking
+    detections:       Optional[SMCDetections] = None
+    sig_eqh_time:     int       = 0
+    sig_eql_time:     int       = 0
+    sig_ob_times:     Set[int]  = field(default_factory=set)
+    last_pretrade_ts: float     = 0.0
 
 
 @dataclass
@@ -513,6 +560,162 @@ def _premium_discount(candles: List[Candle], window: int = 50) -> str:
     if close < mid - band:
         return "DISCOUNT"
     return "EQ"
+
+
+# ===========================================================================
+# LUXALGO-STYLE SMC DETECTION  (1m closed candles)
+# ===========================================================================
+
+
+def _pivot_points(arr: np.ndarray, length: int, is_high: bool) -> List[int]:
+    """Confirmed pivot indices (ta.pivothigh/pivotlow semantics)."""
+    n = len(arr)
+    out: List[int] = []
+    for i in range(length, n - length):
+        left  = arr[i - length:i]
+        right = arr[i + 1:i + length + 1]
+        if is_high:
+            if arr[i] > left.max() and arr[i] > right.max():
+                out.append(i)
+        else:
+            if arr[i] < left.min() and arr[i] < right.min():
+                out.append(i)
+    return out
+
+
+def _detect_equal_extremes(
+    candles: List[Candle],
+    atr_val: float,
+) -> Tuple[Optional[Tuple[float, int]], Optional[Tuple[float, int]]]:
+    """
+    LuxAlgo-style Equal Highs / Equal Lows.
+
+    Two consecutive confirmed pivots within EQ_THRESHOLD * ATR of each
+    other form an EQH (liquidity above) or EQL (liquidity below).
+    Returns ((level, bar_time) | None) for each side.
+    """
+    n = len(candles)
+    if n < EQ_CONFIRM_LEN * 2 + 2:
+        return None, None
+    h = np.array([c.h for c in candles], dtype=float)
+    l = np.array([c.l for c in candles], dtype=float)
+
+    eqh: Optional[Tuple[float, int]] = None
+    eql: Optional[Tuple[float, int]] = None
+
+    ph = _pivot_points(h, EQ_CONFIRM_LEN, True)
+    if len(ph) >= 2:
+        a, b = ph[-2], ph[-1]
+        if max(h[a], h[b]) - min(h[a], h[b]) < EQ_THRESHOLD * atr_val:
+            eqh = (float(max(h[a], h[b])), candles[b].t)
+
+    pl = _pivot_points(l, EQ_CONFIRM_LEN, False)
+    if len(pl) >= 2:
+        a, b = pl[-2], pl[-1]
+        if max(l[a], l[b]) - min(l[a], l[b]) < EQ_THRESHOLD * atr_val:
+            eql = (float(min(l[a], l[b])), candles[b].t)
+
+    return eqh, eql
+
+
+def _parsed_extremes(
+    candles: List[Candle],
+    atr_val: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    LuxAlgo volatility filter: bars with range >= 2*ATR are 'volatile'
+    and contribute their body instead of their wicks to OB zones.
+    """
+    p_hi = np.empty(len(candles), dtype=float)
+    p_lo = np.empty(len(candles), dtype=float)
+    for i, c in enumerate(candles):
+        if c.candle_range >= 2.0 * atr_val:
+            p_hi[i] = max(c.o, c.c)
+            p_lo[i] = min(c.o, c.c)
+        else:
+            p_hi[i] = c.h
+            p_lo[i] = c.l
+    return p_hi, p_lo
+
+
+def _detect_order_blocks(
+    candles: List[Candle],
+    atr_val: float,
+) -> Tuple[List[OBZone], List[OBZone]]:
+    """
+    LuxAlgo-style internal order blocks on closed 1m candles.
+
+    Bullish OB: on a structure break above a confirmed pivot high, the
+    lowest parsed bar inside the leg becomes a demand zone.
+    Bearish OB: on a structure break below a confirmed pivot low, the
+    highest parsed bar inside the leg becomes a supply zone.
+
+    Mitigation (HIGHLOW): bull OB removed once a later low trades below
+    its bottom; bear OB removed once a later high trades above its top.
+    Returns (bull_obs, bear_obs) - unmitigated, oldest first,
+    capped at OB_SHOW_LAST per side.
+    """
+    n = len(candles)
+    if n < OB_INTERNAL_LEN * 2 + 5:
+        return [], []
+
+    h  = np.array([c.h for c in candles], dtype=float)
+    l  = np.array([c.l for c in candles], dtype=float)
+    cl = np.array([c.c for c in candles], dtype=float)
+    p_hi, p_lo = _parsed_extremes(candles, atr_val)
+
+    bull: Dict[int, OBZone] = {}
+    bear: Dict[int, OBZone] = {}
+
+    for pi in _pivot_points(h, OB_INTERNAL_LEN, True):
+        confirm = pi + OB_INTERNAL_LEN
+        brk = next(
+            (i for i in range(confirm, n) if cl[i] > h[pi]), -1
+        )
+        if brk <= pi + 1:
+            continue
+        j = min(range(pi, brk), key=lambda i: p_lo[i])
+        # mitigation check: any later low below zone bottom
+        if brk < n and float(l[brk:].min()) < p_lo[j]:
+            continue
+        bull[candles[j].t] = OBZone(
+            top=float(p_hi[j]), bottom=float(p_lo[j]),
+            bar_time=candles[j].t, bias=1,
+        )
+
+    for pi in _pivot_points(l, OB_INTERNAL_LEN, False):
+        confirm = pi + OB_INTERNAL_LEN
+        brk = next(
+            (i for i in range(confirm, n) if cl[i] < l[pi]), -1
+        )
+        if brk <= pi + 1:
+            continue
+        j = max(range(pi, brk), key=lambda i: p_hi[i])
+        if brk < n and float(h[brk:].max()) > p_hi[j]:
+            continue
+        bear[candles[j].t] = OBZone(
+            top=float(p_hi[j]), bottom=float(p_lo[j]),
+            bar_time=candles[j].t, bias=-1,
+        )
+
+    bull_list = sorted(bull.values(), key=lambda z: z.bar_time)[-OB_SHOW_LAST:]
+    bear_list = sorted(bear.values(), key=lambda z: z.bar_time)[-OB_SHOW_LAST:]
+    return bull_list, bear_list
+
+
+def detect_smc_1m(candles: List[Candle]) -> SMCDetections:
+    """Run all LuxAlgo-style 1m detections over closed candles."""
+    det = SMCDetections()
+    if len(candles) < 30:
+        return det
+    atr_val = _atr(candles, min(200, len(candles) - 1))
+    eqh, eql = _detect_equal_extremes(candles, atr_val)
+    if eqh:
+        det.eqh_level, det.eqh_time = eqh
+    if eql:
+        det.eql_level, det.eql_time = eql
+    det.bull_obs, det.bear_obs = _detect_order_blocks(candles, atr_val)
+    return det
 
 
 # ===========================================================================
@@ -1018,6 +1221,7 @@ _STATE_STYLE: Dict[str, str] = {
     "PRE_SIGNAL":  "bold yellow",
     "ARMED":       "bold red",
     "INVALIDATED": "red",
+    "PRE_TRADE":   "bold magenta",
 }
 
 _STATE_ICON: Dict[str, str] = {
@@ -1625,6 +1829,33 @@ class App:
         s.confidence = a.confidence
         prev         = s.state
 
+        # ------------------------------------------------------------------
+        # LuxAlgo-style 1m detections -> PRE-TRADE signal
+        # EQH / EQL / Bullish OB / Bearish OB on the 1m timeframe
+        # ------------------------------------------------------------------
+        det = detect_smc_1m(buf_1m)
+        s.detections = det
+        events: List[str] = []
+        if det.eqh_level is not None and det.eqh_time != s.sig_eqh_time:
+            s.sig_eqh_time = det.eqh_time
+            events.append(f"EQH @ {det.eqh_level:.6g}")
+        if det.eql_level is not None and det.eql_time != s.sig_eql_time:
+            s.sig_eql_time = det.eql_time
+            events.append(f"EQL @ {det.eql_level:.6g}")
+        for z in det.bear_obs:
+            if z.bar_time not in s.sig_ob_times:
+                s.sig_ob_times.add(z.bar_time)
+                events.append(f"Bearish OB {z.bottom:.6g}-{z.top:.6g}")
+        for z in det.bull_obs:
+            if z.bar_time not in s.sig_ob_times:
+                s.sig_ob_times.add(z.bar_time)
+                events.append(f"Bullish OB {z.bottom:.6g}-{z.top:.6g}")
+        if len(s.sig_ob_times) > 400:            # prune dedupe memory
+            s.sig_ob_times = set(sorted(s.sig_ob_times)[-100:])
+        if events and (time.time() - s.last_pretrade_ts) > PRETRADE_COOLDOWN:
+            s.last_pretrade_ts = time.time()
+            self._fire_pretrade(sym, events, a)
+
         # Invalidation cooldown
         if s.inv_cool > 0:
             s.inv_cool -= 1
@@ -1678,6 +1909,38 @@ class App:
             )
             if fresh:
                 self._fire_alert(sym, new, a, s)
+
+    def _fire_pretrade(self, sym: str, events: List[str], a: Analysis) -> None:
+        """Fire a PRE-TRADE signal for fresh 1m EQH/EQL/OB detections."""
+        reason = "; ".join(events)
+        self.store.save_alert(
+            sym, "PRE_TRADE", a.score, a.zone, a.invalidation,
+            a.confidence.value, reason,
+        )
+        lines = [
+            "\U0001f514 PRE-TRADE SIGNAL (1m SMC)",
+            f"{sym} - 1M - {a.session}",
+            "",
+            "Detected:",
+        ]
+        lines += [f"  \u2022 {e}" for e in events]
+        lines += [
+            "",
+            f"Price: {a.close:.6g}",
+            f"HTF Bias: {a.htf_bias}",
+            f"Zone: {a.premium_disc}",
+            f"Score: {a.score}/{a.max_score}",
+            "",
+            "NOT A CONFIRMED TRADE SIGNAL.",
+        ]
+        if self.tg:
+            self.tg.push("\n".join(lines))
+        ts_str = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        self.alert_feed.appendleft(
+            f"{ts_str} \U0001f514 {sym} PRE_TRADE {reason[:44]}"
+        )
+        self.status_msg = f"PRE-TRADE {sym}: {reason[:48]}"
+        log.info("pretrade sym=%s events=%s", sym, reason)
 
     def _fire_alert(self, sym: str, state: str, a: Analysis, s: Setup) -> None:
         """Persist, queue Telegram, and update UI feed for an alert."""
@@ -1899,6 +2162,40 @@ class App:
         else:
             tb.add_row("[dim]waiting for closed candles...[/]", "")
 
+        # LuxAlgo-style 1m detections
+        d = s.detections
+        if d:
+            tb.add_row("[bold magenta]-- SMC 1m --[/]", "")
+            tb.add_row(
+                "EQH",
+                f"[red]\u2713 {d.eqh_level:.6g}[/]"
+                if d.eqh_level is not None else "[dim]\u25cb[/]",
+            )
+            tb.add_row(
+                "EQL",
+                f"[green]\u2713 {d.eql_level:.6g}[/]"
+                if d.eql_level is not None else "[dim]\u25cb[/]",
+            )
+            bear_z = d.bear_obs[-1] if d.bear_obs else None
+            tb.add_row(
+                "Bear OB",
+                f"[red]\u2713 {bear_z.bottom:.6g}-{bear_z.top:.6g} "
+                f"(x{len(d.bear_obs)})[/]"
+                if bear_z else "[dim]\u25cb[/]",
+            )
+            bull_z = d.bull_obs[-1] if d.bull_obs else None
+            tb.add_row(
+                "Bull OB",
+                f"[green]\u2713 {bull_z.bottom:.6g}-{bull_z.top:.6g} "
+                f"(x{len(d.bull_obs)})[/]"
+                if bull_z else "[dim]\u25cb[/]",
+            )
+            if d.any_detected:
+                tb.add_row(
+                    "",
+                    Text("\U0001f514 PRE-TRADE ACTIVE (1m)", style="bold magenta"),
+                )
+
         banner_text  = _STATE_ICON.get(s.state, s.state)
         banner_style = _STATE_STYLE.get(s.state, "dim")
         tb.add_row("", Text(banner_text, style=banner_style))
@@ -1977,6 +2274,42 @@ class App:
             tb.add_row("Bar count",   str(s.bar_count))
             tb.add_row("Reasons",     "\n".join(a.reasons) or "-")
 
+        # LuxAlgo-style 1m detections (full listing)
+        d = s.detections
+        if d:
+            tb.add_row("[bold magenta]-- SMC 1m DETECTIONS --[/]", "")
+            tb.add_row(
+                "Equal Highs (EQH)",
+                f"[red]\u2713 {d.eqh_level:.8g}[/]"
+                if d.eqh_level is not None else "[dim]none[/]",
+            )
+            tb.add_row(
+                "Equal Lows (EQL)",
+                f"[green]\u2713 {d.eql_level:.8g}[/]"
+                if d.eql_level is not None else "[dim]none[/]",
+            )
+            if d.bear_obs:
+                zones = "\n".join(
+                    f"[red]{z.bottom:.8g} - {z.top:.8g}[/]"
+                    for z in reversed(d.bear_obs)
+                )
+                tb.add_row(f"Bearish OB x{len(d.bear_obs)}", zones)
+            else:
+                tb.add_row("Bearish OB", "[dim]none[/]")
+            if d.bull_obs:
+                zones = "\n".join(
+                    f"[green]{z.bottom:.8g} - {z.top:.8g}[/]"
+                    for z in reversed(d.bull_obs)
+                )
+                tb.add_row(f"Bullish OB x{len(d.bull_obs)}", zones)
+            else:
+                tb.add_row("Bullish OB", "[dim]none[/]")
+            if d.any_detected:
+                tb.add_row(
+                    "",
+                    Text("\U0001f514 PRE-TRADE ACTIVE (1m)", style="bold magenta"),
+                )
+
         banner_text  = _STATE_ICON.get(s.state, s.state)
         banner_style = _STATE_STYLE.get(s.state, "dim")
         tb.add_row("", Text(banner_text, style=f"bold {banner_style}"))
@@ -2050,7 +2383,8 @@ class App:
             )
         disclaimer = (
             "[dim]analysis only - NOT financial advice - "
-            "\U0001f7e1 POSSIBLE FUTURE SHORT signals only[/]"
+            "\U0001f7e1 POSSIBLE FUTURE SHORT - "
+            "\U0001f514 PRE-TRADE = 1m EQH/EQL/OB detection[/]"
         )
         return Panel(
             Text.from_markup(
